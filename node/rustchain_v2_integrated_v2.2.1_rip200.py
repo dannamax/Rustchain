@@ -45,6 +45,22 @@ from hashlib import blake2b
 TESTNET_ALLOW_INLINE_PUBKEY = False  # PRODUCTION: Disabled
 TESTNET_ALLOW_MOCK_SIG = False  # PRODUCTION: Disabled
 
+
+def _runtime_env_name() -> str:
+    return (os.getenv("RC_RUNTIME_ENV") or os.getenv("RUSTCHAIN_ENV") or "").strip().lower()
+
+
+def enforce_mock_signature_runtime_guard() -> None:
+    """Fail closed if mock signature mode is enabled outside test runtime."""
+    if not TESTNET_ALLOW_MOCK_SIG:
+        return
+    if _runtime_env_name() in {"test", "testing", "ci"}:
+        return
+    raise RuntimeError(
+        "Refusing to start with TESTNET_ALLOW_MOCK_SIG enabled outside test runtime "
+        "(set RC_RUNTIME_ENV=test only for tests)."
+    )
+
 try:
     from nacl.signing import VerifyKey
     from nacl.exceptions import BadSignatureError
@@ -184,6 +200,24 @@ def client_ip_from_request(req) -> str:
         if not _is_trusted_proxy_ip(hop):
             return hop
     return remote
+
+
+def _parse_int_query_arg(name: str, default: int, min_value: int | None = None, max_value: int | None = None):
+    raw_value = request.args.get(name)
+    if raw_value is None or str(raw_value).strip() == "":
+        value = default
+    else:
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            return None, f"{name} must be an integer"
+
+    if min_value is not None and value < min_value:
+        value = min_value
+    if max_value is not None and value > max_value:
+        value = max_value
+    return value, None
+
 
 # Register Hall of Rust blueprint (tables initialized after DB_PATH is set)
 try:
@@ -2308,6 +2342,13 @@ def get_epoch():
             (epoch,)
         ).fetchone()[0]
 
+    if not is_admin(request):
+        return jsonify({
+            "epoch": epoch,
+            "blocks_per_epoch": EPOCH_SLOTS,
+            "visibility": "public_redacted"
+        })
+
     return jsonify({
         "epoch": epoch,
         "slot": slot,
@@ -3260,6 +3301,24 @@ def api_miners():
     """Return list of attested miners with their PoA details"""
     import time as _time
     now = int(_time.time())
+
+    if not is_admin(request):
+        with sqlite3.connect(DB_PATH) as conn:
+            active_miners = conn.execute(
+                """
+                SELECT COUNT(DISTINCT miner)
+                FROM miner_attest_recent
+                WHERE ts_ok > ?
+                """,
+                (now - 3600,),
+            ).fetchone()[0]
+
+        return jsonify({
+            "active_miners": int(active_miners or 0),
+            "window_seconds": 3600,
+            "visibility": "public_redacted"
+        })
+
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
@@ -3320,11 +3379,74 @@ def api_miners():
     return jsonify(miners)
 
 
+@app.route("/api/badge/<miner_id>", methods=["GET"])
+def api_badge(miner_id: str):
+    """Shields.io-compatible JSON badge endpoint for a miner's mining status.
+
+    Usage in README:
+        ![Mining Status](https://img.shields.io/endpoint?url=https://rustchain.org/api/badge/YOUR_MINER_ID)
+
+    Returns JSON with schemaVersion, label, message, and color per
+    https://shields.io/endpoint spec.
+    """
+    miner_id = miner_id.strip()
+    if not miner_id:
+        return jsonify({"schemaVersion": 1, "label": "RustChain", "message": "invalid", "color": "red"}), 400
+
+    now = int(time.time())
+    status = "Inactive"
+    hw_type = ""
+    multiplier = 1.0
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT ts_ok, device_family, device_arch FROM miner_attest_recent WHERE miner = ?",
+                (miner_id,),
+            ).fetchone()
+
+            if row and row["ts_ok"]:
+                age = now - int(row["ts_ok"])
+                if age < 1200:       # attested within 20 minutes
+                    status = "Active"
+                elif age < 3600:     # attested within 1 hour
+                    status = "Idle"
+                else:
+                    status = "Inactive"
+
+                fam = (row["device_family"] or "unknown")
+                arch = (row["device_arch"] or "unknown")
+                hw_type = f"{fam}/{arch}"
+                multiplier = HARDWARE_WEIGHTS.get(fam, {}).get(
+                    arch, HARDWARE_WEIGHTS.get(fam, {}).get("default", 1.0)
+                )
+    except Exception:
+        pass
+
+    color_map = {"Active": "brightgreen", "Idle": "yellow", "Inactive": "lightgrey"}
+    color = color_map.get(status, "lightgrey")
+    label = f"⛏ {miner_id}"
+
+    message = status
+    if status == "Active" and multiplier > 1.0:
+        message = f"{status} ({multiplier}x)"
+
+    return jsonify({
+        "schemaVersion": 1,
+        "label": label,
+        "message": message,
+        "color": color,
+    })
+
+
 @app.route("/api/miner/<miner_id>/attestations", methods=["GET"])
 def api_miner_attestations(miner_id: str):
     """Best-effort attestation history for a single miner (museum detail view)."""
-    limit = int(request.args.get("limit", "120") or 120)
-    limit = max(1, min(limit, 500))
+    limit, limit_err = _parse_int_query_arg("limit", 120, min_value=1, max_value=500)
+    if limit_err:
+        return jsonify({"ok": False, "error": limit_err}), 400
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -3362,8 +3484,9 @@ def api_miner_attestations(miner_id: str):
 @app.route("/api/balances", methods=["GET"])
 def api_balances():
     """Return wallet balances (best-effort across schema variants)."""
-    limit = int(request.args.get("limit", "2000") or 2000)
-    limit = max(1, min(limit, 5000))
+    limit, limit_err = _parse_int_query_arg("limit", 2000, min_value=1, max_value=5000)
+    if limit_err:
+        return jsonify({"ok": False, "error": limit_err}), 400
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -3753,6 +3876,9 @@ def api_rewards_epoch(epoch: int):
 @app.route('/wallet/balance', methods=['GET'])
 def api_wallet_balance():
     """Get balance for a specific miner"""
+    if not is_admin(request):
+        return jsonify({"ok": False, "reason": "admin_required"}), 401
+
     miner_id = request.args.get("miner_id", "").strip()
     if not miner_id:
         return jsonify({"ok": False, "error": "miner_id required"}), 400
@@ -3918,7 +4044,9 @@ def list_pending():
         return jsonify({"error": "Unauthorized"}), 401
 
     status_filter = request.args.get('status', 'pending')
-    limit = min(int(request.args.get('limit', 100)), 500)
+    limit, limit_err = _parse_int_query_arg("limit", 100, min_value=1, max_value=500)
+    if limit_err:
+        return jsonify({"ok": False, "error": limit_err}), 400
     
     with sqlite3.connect(DB_PATH) as db:
         if status_filter == 'all':
@@ -4617,6 +4745,16 @@ def wallet_transfer_signed():
         conn.close()
 
 if __name__ == "__main__":
+    try:
+        enforce_mock_signature_runtime_guard()
+    except RuntimeError as e:
+        print("=" * 70, file=sys.stderr)
+        print("FATAL: unsafe mock-signature configuration", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print(str(e), file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        sys.exit(1)
+
     # CRITICAL: SR25519 library is REQUIRED for production
     if not SR25519_AVAILABLE:
         print("=" * 70, file=sys.stderr)

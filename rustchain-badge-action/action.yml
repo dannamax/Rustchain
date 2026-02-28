@@ -1,0 +1,69 @@
+name: 'RustChain Mining Status Badge'
+description: 'Display your RustChain mining status badge in your README'
+author: 'dannamax'
+inputs:
+  wallet:
+    description: 'Your RustChain miner wallet ID'
+    required: true
+    type: string
+  readme-path:
+    description: 'Path to README file (default: README.md)'
+    required: false
+    type: string
+    default: 'README.md'
+  badge-label:
+    description: 'Custom badge label (default: RustChain Mining)'
+    required: false
+    type: string
+    default: 'RustChain Mining'
+outputs:
+  badge-url:
+    description: 'The generated badge URL'
+    value: ${{ steps.badge.outputs.badge-url }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate badge URL
+      id: badge
+      shell: bash
+      run: |
+        BADGE_URL="https://img.shields.io/endpoint?url=https://50.28.86.131/api/badge/${{ inputs.wallet }}"
+        echo "badge-url=$BADGE_URL" >> $GITHUB_OUTPUT
+        echo "Generated badge URL: $BADGE_URL"
+    
+    - name: Update README with badge
+      shell: bash
+      run: |
+        README_PATH="${{ inputs.readme-path }}"
+        BADGE_LABEL="${{ inputs.badge-label }}"
+        BADGE_URL="${{ steps.badge.outputs.badge-url }}"
+        
+        # Create backup
+        cp "$README_PATH" "$README_PATH.bak"
+        
+        # Check if badge already exists
+        if grep -q "RustChain Mining" "$README_PATH"; then
+            # Replace existing badge
+            sed -i "s|!\[$BADGE_LABEL\](https://img.shields.io/endpoint?url=https://50.28.86.131/api/badge/[^)]*)|![$BADGE_LABEL]($BADGE_URL)|g" "$README_PATH"
+            echo "Updated existing badge in $README_PATH"
+        else
+            # Add new badge after first heading or at the end
+            if grep -q "^#" "$README_PATH"; then
+                # Insert after first heading
+                sed -i "/^#/a ![$BADGE_LABEL]($BADGE_URL)" "$README_PATH"
+            else
+                # Append to end
+                echo "" >> "$README_PATH"
+                echo "![$BADGE_LABEL]($BADGE_URL)" >> "$README_PATH"
+            fi
+            echo "Added new badge to $README_PATH"
+        fi
+        
+        # Verify the change
+        if grep -q "$BADGE_URL" "$README_PATH"; then
+            echo "Badge successfully added/updated"
+        else
+            echo "Error: Badge not found in README"
+            mv "$README_PATH.bak" "$README_PATH"
+            exit 1
+        fi
